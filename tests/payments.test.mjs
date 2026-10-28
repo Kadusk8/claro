@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {config,cookie,order,publicPayment,failure,createTestPayment} from '../lib/payments.mjs';
+import {config,cookie,order,publicPayment,failure,createTestPayment,mp} from '../lib/payments.mjs';
 process.env.VERCEL_ENV='preview';
 process.env.MERCADO_PAGO_ACCESS_TOKEN='TEST-synthetic-not-a-credential';
 test('prefix does not determine account type; production deployments remain blocked',()=>{
@@ -41,4 +41,20 @@ test('provider account verification precedes creation, regardless of token prefi
   await assert.rejects(createTestPayment({},'id'),/PAYMENT_MISMATCH/);
   globalThis.fetch=async()=>({ok:false});await assert.rejects(createTestPayment({},'id'),/PROVIDER_FAILURE/);
  }finally{globalThis.fetch=original;process.env.MERCADO_PAGO_ACCESS_TOKEN='TEST-synthetic-not-a-credential';}
+});
+
+test('provider diagnostics distinguish stages and exclude raw provider content',async()=>{
+ const original=globalThis.fetch;
+ try{
+  for(const [path,options,stage] of [['/users/me',{},'ACCOUNT'],['/v1/payments',{method:'POST'},'CREATE'],['/v1/payments/42',{},'STATUS']]){
+   globalThis.fetch=async()=>({ok:false,status:403,json:async()=>({error:'forbidden',message:'DO_NOT_EXPOSE',cause:[{code:13253,description:'DO_NOT_EXPOSE'},{code:'DO_NOT_EXPOSE'}]})});
+   let caught;try{await mp(path,options);}catch(e){caught=e;}
+   let result;failure({status(n){assert.equal(n,502);return this;},json(v){result=v;}},caught);
+   assert.equal(result.code,`MP_${stage}_403`);assert.ok(result.error.includes('13253'));assert.ok(!JSON.stringify(result).includes('DO_NOT_EXPOSE'));
+  }
+  globalThis.fetch=async()=>{throw new Error('DO_NOT_EXPOSE');};
+  await assert.rejects(mp('/users/me'),e=>e.stage==='ACCOUNT'&&e.kind==='NETWORK'&&!e.message.includes('DO_NOT_EXPOSE'));
+  globalThis.fetch=async()=>({ok:true,json:async()=>{throw new Error('DO_NOT_EXPOSE');}});
+  await assert.rejects(mp('/users/me'),e=>e.kind==='INVALID_RESPONSE');
+ }finally{globalThis.fetch=original;}
 });
