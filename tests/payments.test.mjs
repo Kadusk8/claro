@@ -1,10 +1,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {config,cookie,order,publicPayment,failure} from '../lib/payments.mjs';
+import {config,cookie,order,publicPayment,failure,createTestPayment} from '../lib/payments.mjs';
 process.env.VERCEL_ENV='preview';
 process.env.MERCADO_PAGO_ACCESS_TOKEN='TEST-synthetic-not-a-credential';
-test('production credentials and production deployments are blocked',()=>{
- process.env.MERCADO_PAGO_ACCESS_TOKEN='APP_USR-synthetic';assert.throws(config);
+test('prefix does not determine account type; production deployments remain blocked',()=>{
+ process.env.MERCADO_PAGO_ACCESS_TOKEN='APP_USR-synthetic';assert.equal(config(),'APP_USR-synthetic');
  process.env.MERCADO_PAGO_ACCESS_TOKEN='TEST-synthetic-not-a-credential';process.env.VERCEL_ENV='production';assert.throws(config);process.env.VERCEL_ENV='preview';
 });
 test('signed session rejects tampering and expiry',()=>{
@@ -18,11 +18,27 @@ test('amount, reference, currency and live mode must match',()=>{
 
 test('configuration diagnostics identify the prerequisite without exposing credentials',()=>{
  const token='TEST-synthetic-not-a-credential';
- const scenarios=[['production',token,'PREVIEW_REQUIRED'],['preview',undefined,'TOKEN_MISSING'],['preview',' '+token,'TOKEN_WHITESPACE'],['preview','APP_USR-synthetic','TEST_TOKEN_REQUIRED']];
+ const scenarios=[['production',token,'PREVIEW_REQUIRED'],['preview',undefined,'TOKEN_MISSING'],['preview',' '+token,'TOKEN_WHITESPACE']];
  for(const [environment,value,code] of scenarios){
   process.env.VERCEL_ENV=environment;if(value===undefined)delete process.env.MERCADO_PAGO_ACCESS_TOKEN;else process.env.MERCADO_PAGO_ACCESS_TOKEN=value;
   let error;try{config();}catch(e){error=e;}assert.equal(error?.message,code);
   let status,body;failure({status(v){status=v;return this;},json(v){body=v;}},error);assert.equal(status,503);assert.equal(body.code,code);if(value)assert.ok(!JSON.stringify(body).includes(value));
  }
  process.env.VERCEL_ENV='preview';process.env.MERCADO_PAGO_ACCESS_TOKEN=token;
+});
+
+test('provider account verification precedes creation, regardless of token prefix',async()=>{
+ const original=globalThis.fetch;
+ process.env.MERCADO_PAGO_ACCESS_TOKEN='APP_USR-synthetic-not-a-credential';
+ try{
+  for(const account of [{id:42,site_id:'MLB',tags:[]},{id:42,site_id:'MLB'},{id:42,site_id:'MLA',tags:['test_user']}]){
+   const calls=[];globalThis.fetch=async(url)=>{calls.push(url);return {ok:true,json:async()=>account};};
+   await assert.rejects(createTestPayment({},'id'),/TEST_ACCOUNT_REQUIRED/);assert.deepEqual(calls,['https://api.mercadopago.com/users/me']);
+  }
+  const calls=[];globalThis.fetch=async(url,options)=>{calls.push({url,options});return {ok:true,json:async()=>url.endsWith('/users/me')?{id:42,site_id:'MLB',tags:['test_user']}:{collector_id:42,live_mode:false}};};
+  await createTestPayment({transaction_amount:19.9},'stable-key');assert.equal(calls.length,2);assert.equal(calls[1].options.headers['X-Idempotency-Key'],'stable-key');
+  globalThis.fetch=async(url)=>({ok:true,json:async()=>url.endsWith('/users/me')?{id:42,site_id:'MLB',tags:['test_user']}:{collector_id:99}});
+  await assert.rejects(createTestPayment({},'id'),/PAYMENT_MISMATCH/);
+  globalThis.fetch=async()=>({ok:false});await assert.rejects(createTestPayment({},'id'),/PROVIDER_FAILURE/);
+ }finally{globalThis.fetch=original;process.env.MERCADO_PAGO_ACCESS_TOKEN='TEST-synthetic-not-a-credential';}
 });
