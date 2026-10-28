@@ -24,13 +24,14 @@ async function request(path,body){
 }
 const message=document.getElementById('payment-message');
 function updatePayment(data){
+ document.getElementById('pix-details').hidden=!data.code;
  if(data.code){document.getElementById('pix-details').hidden=false;document.getElementById('pix-code').value=data.code;}
- const states={approved:'Pagamento de teste confirmado pelo servidor. O envio de documentos ainda não está disponível.',pending:'Pix de teste gerado. Aguardando confirmação.',in_process:'Pagamento em processamento.',rejected:'Pagamento rejeitado.',cancelled:'Pagamento cancelado.',refunded:'Pagamento reembolsado.'};
+ const states={approved:'Pagamento de teste confirmado pelo servidor. O envio de documentos ainda não está disponível.',pending:'Pix de teste gerado. Aguardando confirmação.',in_process:'Pagamento em processamento.',rejected:'Pagamento rejeitado.',expired:'Cobrança de teste vencida.',cancelled:'Pagamento cancelado.',refunded:'Pagamento reembolsado.'};
  message.textContent=states[data.status]||'Aguardando atualização do pagamento.';
 }
 document.getElementById('generate').addEventListener('click',async event=>{
  const button=event.currentTarget;button.disabled=true;message.textContent='Preparando Pix de teste…';
- try{await request('order',{});const data=await request('payment',{name:document.getElementById('name').value,email:document.getElementById('email').value});updatePayment(data);button.textContent='Consultar Pix existente';}
+ try{await request('order',{});const data=await request('payment',{name:document.getElementById('name').value,email:document.getElementById('email').value,cpf:document.getElementById('cpf').value.replace(/\D/g,'')});updatePayment(data);button.textContent='Consultar Pix existente';}
  catch(error){message.textContent=error.message;}finally{button.disabled=false;}
 });
 document.getElementById('check-payment').addEventListener('click',async event=>{const button=event.currentTarget;button.disabled=true;try{updatePayment(await request('status'));}catch(error){message.textContent=error.message;}finally{button.disabled=false;}});

@@ -1,60 +1,45 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {config,cookie,order,publicPayment,failure,createTestPayment,mp} from '../lib/payments.mjs';
+import {config,cookie,order,asaas,createTestPayment,publicPayment,validatePayment,failure} from '../lib/payments.mjs';
 process.env.VERCEL_ENV='preview';
-process.env.MERCADO_PAGO_ACCESS_TOKEN='TEST-synthetic-not-a-credential';
-test('prefix does not determine account type; production deployments remain blocked',()=>{
- process.env.MERCADO_PAGO_ACCESS_TOKEN='APP_USR-synthetic';assert.equal(config(),'APP_USR-synthetic');
- process.env.MERCADO_PAGO_ACCESS_TOKEN='TEST-synthetic-not-a-credential';process.env.VERCEL_ENV='production';assert.throws(config);process.env.VERCEL_ENV='preview';
+process.env.ASAAS_API_KEY='synthetic-sandbox-key';
+const payment={id:'pay_test',externalReference:'order-test',value:19.9,billingType:'PIX',status:'PENDING'};
+test('production is blocked and missing keys are diagnosed',()=>{
+ process.env.VERCEL_ENV='production';assert.throws(config,/PREVIEW_REQUIRED/);process.env.VERCEL_ENV='preview';delete process.env.ASAAS_API_KEY;assert.throws(config,/TOKEN_MISSING/);process.env.ASAAS_API_KEY='synthetic-sandbox-key';
 });
-test('signed session rejects tampering and expiry',()=>{
- let header;const res={setHeader:(_,v)=>header=v};const data={id:'order-id',expires:Date.now()+10000};cookie(res,data);const raw=header.split(';')[0];assert.deepEqual(order({headers:{cookie:raw}}),data);assert.equal(order({headers:{cookie:raw+'x'}}),null);cookie(res,{...data,expires:Date.now()-1});assert.equal(order({headers:{cookie:header.split(';')[0]}}),null);
+test('sessions reject tampering and expired signatures',()=>{
+ let header;const res={setHeader:(_,v)=>header=v};const data={id:'order-test',expires:Date.now()+10000};cookie(res,data);const raw=header.split(';')[0];assert.deepEqual(order({headers:{cookie:raw}}),data);assert.equal(order({headers:{cookie:raw+'x'}}),null);cookie(res,{...data,expires:0});assert.equal(order({headers:{cookie:header.split(';')[0]}}),null);
 });
-test('amount, reference, currency and live mode must match',()=>{
- const payment={external_reference:'a',transaction_amount:19.9,currency_id:'BRL',live_mode:false,status:'approved'};
- assert.equal(publicPayment(payment,'a').status,'approved');
- for(const change of [{external_reference:'b'},{transaction_amount:1},{currency_id:'USD'},{live_mode:true}])assert.throws(()=>publicPayment({...payment,...change},'a'));
+test('financial fields and reference must match',()=>{
+ for(const change of [{value:1},{billingType:'BOLETO'},{externalReference:'other'},{deleted:true}])assert.throws(()=>validatePayment({...payment,...change},'order-test'),/PAYMENT_MISMATCH/);
 });
-
-test('configuration diagnostics identify the prerequisite without exposing credentials',()=>{
- const token='TEST-synthetic-not-a-credential';
- const scenarios=[['production',token,'PREVIEW_REQUIRED'],['preview',undefined,'TOKEN_MISSING'],['preview',' '+token,'TOKEN_WHITESPACE']];
- for(const [environment,value,code] of scenarios){
-  process.env.VERCEL_ENV=environment;if(value===undefined)delete process.env.MERCADO_PAGO_ACCESS_TOKEN;else process.env.MERCADO_PAGO_ACCESS_TOKEN=value;
-  let error;try{config();}catch(e){error=e;}assert.equal(error?.message,code);
-  let status,body;failure({status(v){status=v;return this;},json(v){body=v;}},error);assert.equal(status,503);assert.equal(body.code,code);if(value)assert.ok(!JSON.stringify(body).includes(value));
- }
- process.env.VERCEL_ENV='preview';process.env.MERCADO_PAGO_ACCESS_TOKEN=token;
+test('only sandbox endpoints are contacted and secrets are not forwarded in errors',async()=>{
+ const original=globalThis.fetch;try{
+  globalThis.fetch=async(url,options)=>{assert.ok(url.startsWith('https://api-sandbox.asaas.com/v3/'));assert.equal(options.headers.access_token,'synthetic-sandbox-key');return {ok:false,status:401,json:async()=>({errors:[{code:'invalid_access_token',description:'SECRET_CONTENT'}]})};};
+  let error;try{await asaas('/customers');}catch(e){error=e;}
+  let body;failure({status(n){assert.equal(n,502);return this;},json(v){body=v;}},error);assert.equal(body.code,'ASAAS_CUSTOMER_401');assert.ok(!JSON.stringify(body).includes('SECRET_CONTENT'));
+  await assert.rejects(asaas('https://api.asaas.com/v3/payments'),/INVALID_PATH/);
+ }finally{globalThis.fetch=original;}
 });
-
-test('provider account verification precedes creation, regardless of token prefix',async()=>{
- const original=globalThis.fetch;
- process.env.MERCADO_PAGO_ACCESS_TOKEN='APP_USR-synthetic-not-a-credential';
- try{
-  for(const account of [{id:42,site_id:'MLB',tags:[]},{id:42,site_id:'MLB'},{id:42,site_id:'MLA',tags:['test_user']}]){
-   const calls=[];globalThis.fetch=async(url)=>{calls.push(url);return {ok:true,json:async()=>account};};
-   await assert.rejects(createTestPayment({},'id'),/TEST_ACCOUNT_REQUIRED/);assert.deepEqual(calls,['https://api.mercadopago.com/users/me']);
-  }
-  const calls=[];globalThis.fetch=async(url,options)=>{calls.push({url,options});return {ok:true,json:async()=>url.endsWith('/users/me')?{id:42,site_id:'MLB',tags:['test_user']}:{collector_id:42,live_mode:false}};};
-  await createTestPayment({transaction_amount:19.9},'stable-key');assert.equal(calls.length,2);assert.equal(calls[1].options.headers['X-Idempotency-Key'],'stable-key');
-  globalThis.fetch=async(url)=>({ok:true,json:async()=>url.endsWith('/users/me')?{id:42,site_id:'MLB',tags:['test_user']}:{collector_id:99}});
-  await assert.rejects(createTestPayment({},'id'),/PAYMENT_MISMATCH/);
-  globalThis.fetch=async()=>({ok:false});await assert.rejects(createTestPayment({},'id'),/PROVIDER_FAILURE/);
- }finally{globalThis.fetch=original;process.env.MERCADO_PAGO_ACCESS_TOKEN='TEST-synthetic-not-a-credential';}
+test('existing payments are reused, duplicates stop creation',async()=>{
+ const original=globalThis.fetch;try{
+  let calls=0;globalThis.fetch=async()=>{calls++;return {ok:true,json:async()=>({data:[payment]})};};assert.equal((await createTestPayment({},'order-test')).id,payment.id);assert.equal(calls,1);
+  globalThis.fetch=async()=>({ok:true,json:async()=>({data:[payment,payment]})});await assert.rejects(createTestPayment({},'order-test'),/DUPLICATE_PAYMENT/);
+ }finally{globalThis.fetch=original;}
 });
-
-test('provider diagnostics distinguish stages and exclude raw provider content',async()=>{
- const original=globalThis.fetch;
- try{
-  for(const [path,options,stage] of [['/users/me',{},'ACCOUNT'],['/v1/payments',{method:'POST'},'CREATE'],['/v1/payments/42',{},'STATUS']]){
-   globalThis.fetch=async()=>({ok:false,status:403,json:async()=>({error:'forbidden',message:'DO_NOT_EXPOSE',cause:[{code:13253,description:'DO_NOT_EXPOSE'},{code:'DO_NOT_EXPOSE'}]})});
-   let caught;try{await mp(path,options);}catch(e){caught=e;}
-   let result;failure({status(n){assert.equal(n,502);return this;},json(v){result=v;}},caught);
-   assert.equal(result.code,`MP_${stage}_403`);assert.ok(result.error.includes('13253'));assert.ok(!JSON.stringify(result).includes('DO_NOT_EXPOSE'));
-  }
-  globalThis.fetch=async()=>{throw new Error('DO_NOT_EXPOSE');};
-  await assert.rejects(mp('/users/me'),e=>e.stage==='ACCOUNT'&&e.kind==='NETWORK'&&!e.message.includes('DO_NOT_EXPOSE'));
-  globalThis.fetch=async()=>({ok:true,json:async()=>{throw new Error('DO_NOT_EXPOSE');}});
-  await assert.rejects(mp('/users/me'),e=>e.kind==='INVALID_RESPONSE');
+test('new sandbox charge uses server price and reference, then QR payload',async()=>{
+ const original=globalThis.fetch;try{
+  const calls=[];globalThis.fetch=async(url,options)=>{
+   calls.push({url,options});let data;
+   if(url.includes('externalReference='))data={data:[]};
+   else if(url.endsWith('/customers'))data={id:'cus_test'};
+   else if(url.endsWith('/pixQrCode'))data={payload:'synthetic-pix-payload',expirationDate:'2030-01-01'};
+   else data=payment;
+   return {ok:true,json:async()=>data};
+  };
+  const result=await createTestPayment({name:'Teste',email:'teste@example.com',cpf:'00000000000'},'order-test');
+  const payload=JSON.parse(calls.find(c=>c.url.endsWith('/payments')).options.body);assert.equal(payload.value,19.9);assert.equal(payload.billingType,'PIX');assert.equal(payload.externalReference,'order-test');assert.match(payload.dueDate,/^\d{4}-\d{2}-\d{2}$/);
+  assert.equal((await publicPayment(result,'order-test')).code,'synthetic-pix-payload');
+  const count=calls.length;assert.deepEqual(await publicPayment({...payment,status:'RECEIVED'},'order-test'),{status:'approved',code:null});assert.equal(calls.length,count);
  }finally{globalThis.fetch=original;}
 });
